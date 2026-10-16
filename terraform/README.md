@@ -1,188 +1,142 @@
-# Terraform — AWS Cluster Infrastructure
+# Terraform — Multi-Provider Kubernetes Infrastructure
 
-Provisions the AWS network and compute resources for one Kubernetes cluster per region.
-Each cluster is fully isolated: its own VPC, subnets, security groups, EC2 nodes, and S3 state key.
+Provisions Kubernetes cluster infrastructure across six providers. Each provider has an
+isolated Terraform root under `terraform/<provider>/`; each cluster has its own tfvars file
+and its own remote state key, so one root can manage any number of clusters.
 
----
+| Provider | Directory | Managed k8s | VM / bare-metal + kubespray |
+|---|---|---|---|
+| AWS | `terraform/aws/` | EKS (`cluster_type = "managed"`) | EC2 (`cluster_type = "kubespray"`) |
+| Google Cloud | `terraform/gcp/` | GKE (`cluster_type = "managed"`) | GCE (`cluster_type = "kubespray"`) |
+| DigitalOcean | `terraform/digitalocean/` | DOKS (`cluster_type = "managed"`) | Droplets (`cluster_type = "kubespray"`) |
+| Latitude.sh | `terraform/latitude/` | — | bare metal + kubespray |
+| OVH | `terraform/ovh/` | — | bare metal + kubespray |
+| Servers.com | `terraform/serverscom/` | — | bare metal + kubespray |
 
-## Directory layout
-
-```
-terraform/
-└── aws/
-    ├── backends/
-    │   ├── dev-ap-south-1.hcl       # S3 state config for ap-south-1
-    │   └── dev-ap-southeast-1.hcl   # S3 state config for ap-southeast-1
-    ├── modules/
-    │   ├── network/                  # VPC, subnets, IGW, NAT, route tables, security groups
-    │   └── compute/                  # EC2 nodes (Ubuntu 24.04 LTS, auto-resolved AMI)
-    ├── main.tf                       # Wires network + compute modules
-    ├── variables.tf                  # All input variables with descriptions and defaults
-    ├── outputs.tf                    # Node IPs, subnet IDs, VPC ID
-    ├── providers.tf                  # AWS provider (region driven by var.region)
-    ├── versions.tf                   # Terraform >= 1.6, AWS ~> 5.0, S3 backend declaration
-    ├── dev-ap-south-1.tfvars         # Variable values for ap-south-1
-    └── dev-ap-southeast-1.tfvars     # Variable values for ap-southeast-1
-```
+See each provider's `README.md` for provider-specific prerequisites, credentials, and resources.
 
 ---
 
-## Prerequisites
+## Layout convention (every provider)
 
-| Requirement | Detail |
-|---|---|
-| Terraform | >= 1.6.0 |
-| AWS CLI | Configured with credentials that have EC2 + VPC + IAM permissions |
-| S3 bucket | `k8s-kubespray-tfstate` must exist in `ap-south-1` before first use |
-| EC2 key pair | Must exist in the **target region** before apply (set as `key_name` in tfvars) |
-
-The S3 bucket is shared across all clusters but each cluster writes to its own key:
 ```
-clusters/aws/<cluster-name>/terraform.tfstate
+terraform/<provider>/
+├── backends/<cluster>.hcl     # one per cluster — remote state key
+├── <cluster>.tfvars           # one per cluster — variable values
+├── main.tf                    # wires the modules; cluster_type switches managed vs kubespray
+├── variables.tf / outputs.tf / providers.tf / versions.tf
+└── modules/
+    ├── network/               # cloud providers: VPC, subnets, firewalls/SGs, NAT
+    ├── compute/               # kubespray VM nodes (Ubuntu 24.04)
+    ├── <managed>/             # eks / gke / doks
+    └── baremetal/             # latitude / ovh / serverscom servers
 ```
 
----
+### State
 
-## Adding a new region — step by step
+All providers share one S3 bucket (`k8s-kubespray-tfstate`, `ap-south-1`, native lockfile
+locking, encryption on) with one key per cluster:
 
-### 1. Create the tfvars file
+```
+clusters/<provider>/<cluster-name>/terraform.tfstate
+```
 
-Copy an existing one and edit every value:
+The bucket must exist before first use (one-time bootstrap, see below). AWS credentials are
+therefore needed for state access even when provisioning other providers.
 
 ```bash
-cp terraform/aws/dev-ap-south-1.tfvars terraform/aws/<cluster-name>.tfvars
+aws s3api create-bucket --bucket k8s-kubespray-tfstate --region ap-south-1 \
+  --create-bucket-configuration LocationConstraint=ap-south-1
+aws s3api put-bucket-versioning --bucket k8s-kubespray-tfstate \
+  --versioning-configuration Status=Enabled
 ```
 
-```hcl
-# terraform/aws/<cluster-name>.tfvars
+### Standard outputs (contract used by the scripts)
 
-cluster_name = "<cluster-name>"          # e.g. prod-eu-west-1
-region       = "<aws-region>"            # e.g. eu-west-1
-project      = "k8s-multicluster"
-
-vpc_cidr = "10.32.0.0/16"               # must not overlap with other clusters
-
-nat_gateway_count  = 1                   # 1 = single NAT (dev), 3 = one per AZ (HA)
-operator_ssh_cidrs = ["<your-ip>/32"]    # CIDR(s) allowed to SSH to nodes
-
-key_name       = "<keypair-name>"        # existing EC2 key pair in the target region
-instance_type  = "c5a.xlarge"
-instance_count = 1                       # number of k8s nodes
-root_volume_gb = 100
-```
-
-> **VPC CIDR**: each cluster must use a unique, non-overlapping /16.
-> Existing allocations: `10.30.0.0/16` (ap-south-1), `10.31.0.0/16` (ap-southeast-1).
-
-### 2. Create the backend config file
-
-```bash
-cp terraform/aws/backends/dev-ap-south-1.hcl terraform/aws/backends/<cluster-name>.hcl
-```
-
-```hcl
-# terraform/aws/backends/<cluster-name>.hcl
-
-bucket       = "k8s-kubespray-tfstate"
-key          = "clusters/aws/<cluster-name>/terraform.tfstate"
-region       = "ap-south-1"              # bucket region — always ap-south-1
-use_lockfile = true
-encrypt      = true
-```
-
-Only the `key` line changes between clusters. The bucket region is always `ap-south-1` (where the bucket lives).
+- Kubespray-mode roots output `node_public_ips` (SSH / `ansible_host`) and
+  `node_private_ips` (NIC-bound `ip=` for kubelet/etcd). Bare-metal providers may return
+  the same list for both when there is no private NIC.
+- Managed-mode roots output the cluster name, endpoint, CA certificate and a
+  `kubeconfig_command` to fetch credentials for `argocd cluster add`.
 
 ---
 
-## Running Terraform
+## Workflow
 
-Always use `scripts/tf.sh` — never run `terraform` directly from `terraform/aws/`.
-The script re-initialises Terraform with the correct S3 backend before every command,
-preventing state from one cluster being applied to another.
+Always run Terraform through `scripts/tf.sh` — it re-initialises the correct per-cluster
+backend before every command so clusters can never cross-apply each other's state:
 
 ```bash
-# Preview changes
-./scripts/tf.sh <cluster-name> plan
-
-# Provision infrastructure
-./scripts/tf.sh <cluster-name> apply
-
-# Target a specific resource
-./scripts/tf.sh <cluster-name> apply -target=module.network
-
-# Tear down
-./scripts/tf.sh <cluster-name> destroy
+./scripts/tf.sh <provider> <cluster> plan
+./scripts/tf.sh <provider> <cluster> apply
+./scripts/tf.sh <provider> <cluster> output
+./scripts/tf.sh <provider> <cluster> destroy     # confirm with the team first
+# provider defaults to aws when omitted (backward compatible):
+./scripts/tf.sh dev-ap-south-1 plan
 ```
 
-### Why not run terraform directly?
+## Adding a cluster (any provider)
 
-All clusters share the same `terraform/aws/` working directory. Terraform remembers the
-last-initialised backend in `.terraform/`. Running `terraform apply -var-file=cluster-B.tfvars`
-without re-initing first points Terraform at **cluster A's state**, causing it to reconcile
-cluster A's live resources toward cluster B's config — destroying or corrupting cluster A.
+```bash
+# 1. Scaffold kubespray inventory + ArgoCD gitops registration
+./scripts/new-cluster.sh <provider> <cluster> <environment> <region>          # kubespray
+./scripts/new-cluster.sh <provider> <cluster> <environment> <region> --managed # EKS/GKE/DOKS
 
-`tf.sh` runs `terraform init -reconfigure -backend-config=backends/<cluster>.hcl` every
-time, so each cluster always gets its own isolated state.
+# 2. Create tfvars + backend from the provider's examples
+cp terraform/<provider>/<example>.tfvars terraform/<provider>/<cluster>.tfvars
+cp terraform/<provider>/backends/<example>.hcl terraform/<provider>/backends/<cluster>.hcl
+# edit both: unique CIDRs, region, node sizing, state key
+
+# 3. Provision
+./scripts/tf.sh <provider> <cluster> apply
+
+# 4a. Kubespray clusters: render inventory, install k8s
+./scripts/render-inventory.sh <provider> <cluster>
+./scripts/kubespray.sh <cluster> cluster.yml
+
+# 4b. Managed clusters: fetch kubeconfig
+./scripts/tf.sh <provider> <cluster> output    # shows kubeconfig_command — run it
+
+# 5. Register with ArgoCD so the base-addons ApplicationSet deploys to it
+argocd cluster add <kube-context> --name <cluster>
+# set server: in gitops/clusters/<cluster>/cluster.yaml to the URL from `argocd cluster list`
+git add gitops/clusters/<cluster> && git commit && git push
+```
+
+The `base-addons` ApplicationSet (gitops/base-addons/appset.yaml) detects the new
+`gitops/clusters/<cluster>/cluster.yaml` and rolls out the addon stack
+(cilium → cert-manager → externaldns → kong → victoria-metrics → eso) automatically.
+Note: managed clusters (EKS/GKE/DOKS) ship their own CNI — remove or no-op the cilium
+values for those clusters, or exclude them from the cilium element (see
+gitops/clusters/README.md).
+
+## Scaling a kubespray cluster
+
+```bash
+# edit instance/node count in terraform/<provider>/<cluster>.tfvars
+./scripts/tf.sh <provider> <cluster> apply
+./scripts/render-inventory.sh <provider> <cluster>
+./scripts/kubespray.sh <cluster> scale.yml        # or cluster.yml for first install
+```
+
+Managed clusters scale via their node pool variables (or autoscaling min/max) in tfvars.
 
 ---
 
-## What gets provisioned
+## Security model (least privilege)
 
-### Network module
-- VPC with DNS support and hostnames enabled
-- 3 public subnets (one per AZ, auto-discovered from the region)
-- 3 private subnets (one per AZ)
-- Internet Gateway
-- 1 or 3 NAT Gateways (controlled by `nat_gateway_count`)
-- Public route table shared across all public subnets
-- Private route table(s) routing through NAT
-- **Public security group** — inbound SSH from `operator_ssh_cidrs`, all outbound
-- **Private security group** — unrestricted intra-cluster traffic, all outbound
-
-> Subnet CIDRs are auto-derived from `vpc_cidr` when not specified:
-> public `/24` at offsets 0–2, private `/24` at offsets 10–12.
-
-### Compute module
-- EC2 nodes running **Ubuntu 24.04 LTS** (AMI auto-resolved per region)
-- Nodes placed in public subnets with public IPs (for SSH and kubespray access)
-- Nodes distributed round-robin across AZs
-- Root EBS volume sized by `root_volume_gb`
-
----
-
-## Key outputs
-
-After `apply`, Terraform prints:
-
-| Output | Use |
-|---|---|
-| `node_public_ips` | SSH access; set in Kubespray inventory as `ansible_host` |
-| `node_private_ips` | Kubespray `ip` field (the NIC-bound address kubelet binds to) |
-| `ami_id` | The resolved Ubuntu 24.04 AMI for this region |
-| `vpc_id` | Reference for additional resources |
-| `public_subnet_ids` | Available for load balancers or additional nodes |
-
-Capture outputs at any time:
-
-```bash
-cd terraform/aws
-terraform output -json
-```
-
-Or after a fresh init:
-
-```bash
-./scripts/tf.sh <cluster-name> output
-```
-
----
-
-## Next step after provisioning
-
-Update the Kubespray inventory with the node IPs output by Terraform, then run:
-
-```bash
-./scripts/kubespray.sh <cluster-name> cluster.yml
-```
-
-See `clusters/<cluster-name>/` for inventory and group_vars configuration.
+- **State**: encrypted S3 state, one key per cluster, native lockfile locking.
+- **AWS**: nodes use IMDSv2 only, encrypted gp3 volumes; SSH limited to `operator_ssh_cidrs`;
+  EKS has dedicated cluster/node IAM roles with only the required AWS-managed policies,
+  OIDC/IRSA for pod-level IAM, control-plane audit logging, optional KMS secrets encryption.
+- **GCP**: dedicated node service accounts with only logging/monitoring (+ Artifact Registry
+  read for GKE) roles — never the default compute SA; GKE uses Workload Identity, shielded
+  + private nodes; VMs are Shielded VMs with project-wide SSH keys blocked.
+- **DigitalOcean**: per-cluster VPC and a droplet firewall allowing only operator SSH,
+  intra-cluster traffic, and the Kong NodePorts; use a scoped API token.
+- **Bare metal (Latitude / OVH / Servers.com)**: SSH key-only access; API credentials
+  scoped to the minimum routes/permissions the provider allows; public interfaces should be
+  firewalled (host firewall / provider firewall) to operator CIDRs + NodePorts.
+- **Ingress**: NodePort 30080/30443 (Kong) is the only intentionally public service;
+  the Kubernetes API (6443) is never exposed publicly on kubespray clusters — reach it via
+  SSH tunnel; managed control planes support authorized-network restriction via tfvars.

@@ -48,3 +48,36 @@ output "ami_id" {
   description = "Resolved Ubuntu 24.04 LTS AMI."
   value       = module.compute.ami_id
 }
+
+# --- EKS (null when cluster_type = "kubespray") ---
+
+output "eks_cluster_name" {
+  description = "EKS cluster name."
+  value       = one(module.eks[*].cluster_name)
+}
+
+output "eks_cluster_endpoint" {
+  description = "EKS API server endpoint."
+  value       = one(module.eks[*].cluster_endpoint)
+}
+
+output "eks_cluster_ca" {
+  description = "Base64-encoded EKS cluster CA certificate."
+  value       = one(module.eks[*].cluster_ca)
+  sensitive   = true
+}
+
+output "eks_oidc_provider_arn" {
+  description = "IAM OIDC provider ARN for IRSA role trust policies."
+  value       = one(module.eks[*].oidc_provider_arn)
+}
+
+output "eks_node_role_arn" {
+  description = "IAM role ARN of the EKS managed node group."
+  value       = one(module.eks[*].node_role_arn)
+}
+
+output "kubeconfig_command" {
+  description = "Fetch kubeconfig for this cluster, then register it with ArgoCD via 'argocd cluster add'."
+  value       = var.cluster_type == "managed" ? "aws eks update-kubeconfig --region ${var.region} --name ${var.cluster_name}" : null
+}

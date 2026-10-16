@@ -7,6 +7,13 @@ spec:
   goTemplate: true
   goTemplateOptions: ["missingkey=error"]
   generators:
+    # Two matrix generators, unioned. Both scan gitops/clusters/*/cluster.yaml;
+    # the post-selector on clusterType decides which addon list a cluster gets:
+    #   clusterType: kubespray — full stack including cilium (CNI installed by us)
+    #   clusterType: managed   — EKS/GKE/DOKS ship their own CNI, cilium excluded
+    # Every cluster.yaml MUST set clusterType (scaffolded by scripts/new-cluster.sh).
+
+    # --- kubespray clusters: full addon stack -------------------------------
     - matrix:
         generators:
           # Axis 1 — each file found at gitops/clusters/*/cluster.yaml is one target cluster.
@@ -16,7 +23,7 @@ spec:
               revision: main
               files:
                 - path: "gitops/clusters/*/cluster.yaml"
-          # Axis 2 — the four base addons deployed to every registered cluster.
+          # Axis 2 — base addons deployed to every kubespray cluster.
           # Sync waves enforce install order: cilium (CNI) → cert-manager → externaldns → kong
           - list:
               elements:
@@ -56,6 +63,53 @@ spec:
                   chart: external-secrets
                   targetRevision: "2.6.0"
                   syncWave: "5"
+      selector:
+        matchLabels:
+          clusterType: kubespray
+
+    # --- managed clusters (EKS/GKE/DOKS): same stack minus cilium ----------
+    - matrix:
+        generators:
+          - git:
+              repoURL: https://github.com/sgrsaga/k8s_kubspray.git
+              revision: main
+              files:
+                - path: "gitops/clusters/*/cluster.yaml"
+          - list:
+              elements:
+                - addon: cert-manager
+                  namespace: cert-manager
+                  repoURL: https://charts.jetstack.io
+                  chart: cert-manager
+                  targetRevision: "v1.16.2"
+                  syncWave: "1"
+                - addon: externaldns
+                  namespace: externaldns
+                  repoURL: https://kubernetes-sigs.github.io/external-dns/
+                  chart: external-dns
+                  targetRevision: "1.15.0"
+                  syncWave: "2"
+                - addon: kong
+                  namespace: kong
+                  repoURL: https://charts.konghq.com
+                  chart: kong
+                  targetRevision: "2.52.0"
+                  syncWave: "3"
+                - addon: victoria-metrics
+                  namespace: monitoring
+                  repoURL: https://victoriametrics.github.io/helm-charts/
+                  chart: victoria-metrics-k8s-stack
+                  targetRevision: "0.82.0"
+                  syncWave: "4"
+                - addon: eso
+                  namespace: external-secrets
+                  repoURL: https://charts.external-secrets.io
+                  chart: external-secrets
+                  targetRevision: "2.6.0"
+                  syncWave: "5"
+      selector:
+        matchLabels:
+          clusterType: managed
 
   template:
     metadata:

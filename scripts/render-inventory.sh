@@ -1,21 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./scripts/render-inventory.sh <cluster> [--init]
+# Usage: ./scripts/render-inventory.sh [provider] <cluster> [--init]
 #
 # Reads terraform output for the given cluster and rewrites the [all] block
-# in clusters/<cluster>/inventory.ini with real node public IPs.
-# Bare-metal lines (commented or active) are preserved untouched.
+# in clusters/<cluster>/inventory.ini with real node IPs:
+#   ansible_host = public IP  (SSH reachability for kubespray)
+#   ip           = private IP (NIC-bound address kubelet/etcd bind to;
+#                              falls back to public IP when the provider
+#                              has no separate private NIC, e.g. bare metal)
+# Bare-metal joiner lines (commented) are preserved untouched.
 #
-#   ./scripts/render-inventory.sh dev-ap-south-1
-#   ./scripts/render-inventory.sh dev-ap-south-1 --init   # re-run terraform init first
+#   ./scripts/render-inventory.sh aws dev-ap-south-1
+#   ./scripts/render-inventory.sh gcp dev-asia-south1 --init
+#   ./scripts/render-inventory.sh dev-ap-south-1            # provider defaults to aws
 
-CLUSTER="${1:?Usage: ./scripts/render-inventory.sh <cluster> [--init]}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+ARG1="${1:?Usage: ./scripts/render-inventory.sh [provider] <cluster> [--init]}"
+
+if [[ -d "${REPO_ROOT}/terraform/${ARG1}" ]]; then
+  PROVIDER="${ARG1}"
+  shift
+else
+  PROVIDER="aws"
+fi
+
+CLUSTER="${1:?Usage: ./scripts/render-inventory.sh [provider] <cluster> [--init]}"
 INIT=false
 [[ "${2:-}" == "--init" ]] && INIT=true
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TF_DIR="${REPO_ROOT}/terraform/aws"
+TF_DIR="${REPO_ROOT}/terraform/${PROVIDER}"
 CLUSTER_DIR="${REPO_ROOT}/clusters/${CLUSTER}"
 INVENTORY="${CLUSTER_DIR}/inventory.ini"
 
@@ -30,38 +45,41 @@ fi
 
 if [[ ! -f "${INVENTORY}" ]]; then
   echo "Error: inventory not found: ${INVENTORY}" >&2
+  echo "Hint: scaffold it with ./scripts/new-cluster.sh ${PROVIDER} ${CLUSTER}" >&2
   exit 1
 fi
 
 if [[ "${INIT}" == true ]]; then
-  echo "Re-initialising Terraform backend for ${CLUSTER}..."
+  echo "Re-initialising Terraform backend for ${PROVIDER}/${CLUSTER}..."
   (cd "${TF_DIR}" && terraform init \
     -backend-config="backends/${CLUSTER}.hcl" \
     -reconfigure -no-color)
 fi
 
-echo "Reading Terraform outputs for ${CLUSTER}..."
-TF_OUTPUT=$(cd "${TF_DIR}" && terraform output \
-  -var-file="${CLUSTER}.tfvars" \
-  -var="cluster_name=${CLUSTER}" \
-  -json 2>/dev/null)
+echo "Reading Terraform outputs for ${PROVIDER}/${CLUSTER}..."
+TF_OUTPUT=$(cd "${TF_DIR}" && terraform output -json)
 
-# Extract public IPs — nodes are reachable directly (no bastion).
-mapfile -t NODE_IPS < <(echo "${TF_OUTPUT}" | jq -r '.node_public_ips.value[]')
+mapfile -t PUBLIC_IPS < <(echo "${TF_OUTPUT}" | jq -r '.node_public_ips.value[]? // empty')
+mapfile -t PRIVATE_IPS < <(echo "${TF_OUTPUT}" | jq -r '.node_private_ips.value[]? // empty')
 
-if [[ ${#NODE_IPS[@]} -eq 0 ]]; then
-  echo "Error: no node_public_ips in Terraform output. Has terraform apply been run?" >&2
+if [[ ${#PUBLIC_IPS[@]} -eq 0 ]]; then
+  echo "Error: no node_public_ips in Terraform output. Has terraform apply been run" \
+       "with the ${CLUSTER} backend initialised (try --init)?" >&2
   exit 1
 fi
 
-echo "Found ${#NODE_IPS[@]} node(s): ${NODE_IPS[*]}"
+# Fall back to public IPs when the provider has no separate private NIC.
+if [[ ${#PRIVATE_IPS[@]} -ne ${#PUBLIC_IPS[@]} ]]; then
+  PRIVATE_IPS=("${PUBLIC_IPS[@]}")
+fi
 
-# Build replacement [all] block (cloud nodes only; bare-metal lines preserved by awk).
+echo "Found ${#PUBLIC_IPS[@]} node(s): ${PUBLIC_IPS[*]}"
+
+# Build replacement [all] block (terraform nodes only; bare-metal joiner lines preserved by awk).
 ALL_BLOCK="[all]"$'\n'
-for i in "${!NODE_IPS[@]}"; do
+for i in "${!PUBLIC_IPS[@]}"; do
   N=$((i + 1))
-  IP="${NODE_IPS[$i]}"
-  ALL_BLOCK+="node-${N} ansible_host=${IP} ip=${IP} etcd_member_name=etcd${N}"$'\n'
+  ALL_BLOCK+="node-${N} ansible_host=${PUBLIC_IPS[$i]} ip=${PRIVATE_IPS[$i]} etcd_member_name=etcd${N}"$'\n'
 done
 
 TMPFILE=$(mktemp)
@@ -88,3 +106,5 @@ awk -v new_block="${ALL_BLOCK}" '
 
 mv "${TMPFILE}" "${INVENTORY}"
 echo "Inventory updated: ${INVENTORY}"
+echo
+echo "Next: ./scripts/kubespray.sh ${CLUSTER} cluster.yml"

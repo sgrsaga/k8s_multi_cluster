@@ -6,3 +6,6 @@ server: https://kubernetes.default.svc
 environment: dev
 region: ap-south-1
 provider: aws
+# kubespray = we install the CNI (cilium addon deployed)
+# managed   = EKS/GKE/DOKS provide the CNI (cilium addon skipped)
+clusterType: kubespray

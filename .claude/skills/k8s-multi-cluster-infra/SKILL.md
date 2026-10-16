@@ -10,177 +10,143 @@ description: |
 
 # Multi-Provider K8s Infrastructure
 
-Terraform-managed Kubernetes node infrastructure across cloud providers (AWS, GCP, Azure,
-DigitalOcean) and bare-metal providers (OVH, Latitude). Each provider has its own isolated
-Terraform root under `terraform/<provider>/` with its own modules.
+Terraform-managed Kubernetes infrastructure across three cloud providers (AWS, GCP,
+DigitalOcean — each supporting managed k8s AND kubespray VMs) and three bare-metal
+providers (Latitude.sh, OVH, Servers.com — kubespray only). Each provider has its own
+isolated Terraform root under `terraform/<provider>/` with its own modules.
 
-Currently live: **AWS** (networking + computing modules).
-Placeholder stubs: `gcp/`, `azure/`, `digitalocean/`, `ovh/`, `latitude/`.
+| Provider | Managed k8s | Kubespray nodes | Notes |
+|---|---|---|---|
+| `aws` | EKS | EC2 | live: dev-ap-south-1, dev-ap-southeast-1 (kubespray) |
+| `gcp` | GKE | GCE VMs | |
+| `digitalocean` | DOKS | Droplets | |
+| `latitude` | — | bare metal | servers ordered via terraform (latitudesh provider) |
+| `ovh` | — | bare metal | servers ordered manually; terraform manages OS/reinstall |
+| `serverscom` | — | bare metal | |
+| `azure` | — | — | empty placeholder |
+
+Cloud roots switch mode via `cluster_type = "managed" | "kubespray"` in the cluster's tfvars.
 
 ---
 
 ## Directory Layout
 
 ```
-terraform/
-├── aws/
-│   ├── main.tf, variables.tf, outputs.tf, providers.tf, versions.tf
-│   ├── backends/<cluster-name>.hcl    # one per cluster — S3 state key
-│   ├── <cluster-name>.tfvars          # one per cluster — variable values
-│   └── modules/
-│       ├── networking/    # VPC, IGW, subnets, NAT GWs, route tables, SGs
-│       └── computing/     # N EC2 instances (k8s nodes), Ubuntu 24.04 LTS
-├── gcp/modules/           # placeholder
-├── azure/modules/         # placeholder
-├── digitalocean/modules/  # placeholder
-├── ovh/modules/           # placeholder
-└── latitude/modules/      # placeholder
+terraform/<provider>/
+├── main.tf, variables.tf, outputs.tf, providers.tf, versions.tf
+├── backends/<cluster-name>.hcl    # one per cluster — S3 state key
+├── <cluster-name>.tfvars          # one per cluster — variable values
+└── modules/
+    ├── network/     # cloud: VPC/subnets/firewalls/NAT
+    ├── compute/     # kubespray VM nodes (Ubuntu 24.04)
+    ├── eks|gke|doks # managed control plane + node pools (cloud only)
+    └── baremetal/   # latitude/ovh/serverscom servers
+
+clusters/<cluster-name>/           # kubespray inventory + group_vars (from clusters/_template)
+gitops/clusters/<cluster-name>/    # ArgoCD ApplicationSet registration (cluster.yaml + values/)
 ```
 
-One Terraform state per cluster. Cluster identity is `cluster_name` (e.g. `dev-ap-south-1`,
-`prod-eu-west-1`). Backends and tfvars files are named to match.
+One Terraform state per cluster in the shared S3 bucket `k8s-kubespray-tfstate`
+(key `clusters/<provider>/<cluster>/terraform.tfstate`). Cluster identity is
+`cluster_name` (e.g. `dev-ap-south-1`); backends and tfvars files are named to match.
+AWS credentials are required for state access even for non-AWS providers.
+
+Provider credentials come from the environment: AWS CLI profile, `gcloud auth
+application-default login`, `DIGITALOCEAN_TOKEN`, `LATITUDESH_AUTH_TOKEN`,
+`OVH_APPLICATION_KEY/OVH_APPLICATION_SECRET/OVH_CONSUMER_KEY`, `SERVERSCOM_TOKEN`
+(see each provider README for exact names and least-privilege scoping).
 
 ---
 
-## First-Run Setup
+## Terraform Workflow (any provider, any cluster)
 
-Replace `CHANGE_ME` in the cluster's tfvars and backend HCL before running anything:
-
-| File | Field | Value |
-|---|---|---|
-| `terraform/aws/backends/<cluster>.hcl` | `bucket` | Globally-unique S3 bucket (must already exist) |
-| `terraform/aws/<cluster>.tfvars` | `key_name` | Existing AWS EC2 key pair name in the target region |
-
-The S3 bucket must be created manually (bootstrap once per AWS account):
-```bash
-aws s3api create-bucket \
-  --bucket <your-bucket-name> \
-  --region ap-south-1 \
-  --create-bucket-configuration LocationConstraint=ap-south-1
-aws s3api put-bucket-versioning \
-  --bucket <your-bucket-name> \
-  --versioning-configuration Status=Enabled
-```
-
----
-
-## Terraform Workflow (any cluster)
+Always use `scripts/tf.sh` — never run `terraform` directly. It re-inits the correct
+per-cluster backend every time so clusters never cross-apply each other's state, and it
+injects `-var cluster_name=<cluster>`:
 
 ```bash
-cd terraform/aws
-
-# Initialise (first time, or after backend change)
-terraform init -backend-config=backends/<cluster>.hcl -reconfigure
-
-# Preview changes
-terraform plan -var-file=<cluster>.tfvars
-
-# Apply
-terraform apply -var-file=<cluster>.tfvars
-
-# Destroy (irreversible — confirm with user first)
-terraform destroy -var-file=<cluster>.tfvars
-```
-
-Example for the default dev cluster:
-```bash
-cd terraform/aws
-terraform init -backend-config=backends/dev-ap-south-1.hcl -reconfigure
-terraform plan -var-file=dev-ap-south-1.tfvars
+./scripts/tf.sh <provider> <cluster> plan
+./scripts/tf.sh <provider> <cluster> apply
+./scripts/tf.sh <provider> <cluster> output
+./scripts/tf.sh <provider> <cluster> destroy   # irreversible — confirm with user first
+# provider defaults to aws when omitted (backward compatible)
 ```
 
 ---
 
 ## How to Add a New Cluster
 
-1. **Choose a name** — convention: `<purpose>-<region>` e.g. `prod-us-east-1`.
-
-2. **Copy and edit the tfvars**:
+1. **Scaffold** (kubespray inventory from `clusters/_template` + gitops registration):
    ```bash
-   cp terraform/aws/dev-ap-south-1.tfvars terraform/aws/prod-us-east-1.tfvars
-   # Edit: cluster_name, region, vpc_cidr, azs, subnet CIDRs, instance_type,
-   #       instance_count, key_name
-   ```
-   Use a non-overlapping VPC CIDR for each cluster (e.g. `10.31.0.0/16` for the next one).
-
-3. **Copy and edit the backend HCL**:
-   ```bash
-   cp terraform/aws/backends/dev-ap-south-1.hcl terraform/aws/backends/prod-us-east-1.hcl
-   # Edit: key = "clusters/aws/prod-us-east-1/terraform.tfstate"
-   #        region = "us-east-1"
+   ./scripts/new-cluster.sh <provider> <cluster> <environment> <region>            # kubespray
+   ./scripts/new-cluster.sh <provider> <cluster> <environment> <region> --managed  # EKS/GKE/DOKS
    ```
 
-4. **Initialise and apply**:
+2. **Create tfvars + backend** from the provider's example files:
    ```bash
-   cd terraform/aws
-   terraform init -backend-config=backends/prod-us-east-1.hcl -reconfigure
-   terraform apply -var-file=prod-us-east-1.tfvars
+   cp terraform/<provider>/<example>.tfvars terraform/<provider>/<cluster>.tfvars
+   cp terraform/<provider>/backends/<example>.hcl terraform/<provider>/backends/<cluster>.hcl
+   # edit: region, unique non-overlapping CIDR, node sizing, SSH key, state key path
    ```
+   VPC CIDR allocations so far: `10.30.0.0/16` (aws dev-ap-south-1), `10.31.0.0/16`
+   (aws dev-ap-southeast-1). Pick the next free /16 per new cluster.
 
-5. **Update kubespray inventory** — run `scripts/render-inventory.sh <cluster>` after apply.
+3. **Apply**: `./scripts/tf.sh <provider> <cluster> apply`
+
+4. **Kubespray clusters** — render inventory and install:
+   ```bash
+   ./scripts/render-inventory.sh <provider> <cluster>
+   ./scripts/kubespray.sh <cluster> cluster.yml
+   ```
+   **Managed clusters** — run the `kubeconfig_command` from terraform output.
+
+5. **Register with ArgoCD**: `argocd cluster add <context> --name <cluster>`, set
+   `server:` in `gitops/clusters/<cluster>/cluster.yaml`, push. The base-addons
+   ApplicationSet deploys the stack automatically (`clusterType: managed` clusters
+   skip cilium — managed CNIs are used instead).
 
 ---
 
 ## How to Scale Nodes
 
-Change `instance_count` in the cluster's tfvars, then plan and apply:
+Kubespray clusters: change `instance_count` (aws) / `node_count` (gcp/do/baremetal) in the
+cluster's tfvars, then:
 
 ```bash
-# Edit terraform/aws/<cluster>.tfvars:
-#   instance_count = 4   (was 2)
-
-cd terraform/aws
-terraform plan -var-file=<cluster>.tfvars   # shows +2 instances
-terraform apply -var-file=<cluster>.tfvars
+./scripts/tf.sh <provider> <cluster> apply
+./scripts/render-inventory.sh <provider> <cluster>
+./scripts/kubespray.sh <cluster> scale.yml
 ```
 
-Scale down works the same way — Terraform destroys the highest-indexed instances first.
-After scaling, re-run `scripts/render-inventory.sh` to update the kubespray inventory.
+Managed clusters: change the node pool min/max/desired vars in tfvars and apply.
 
 ---
 
-## AWS Networking Module
+## Security Model (least privilege — keep it that way)
 
-Resources per cluster:
-- VPC + Internet Gateway
-- 3 public subnets + 3 private subnets (one per AZ, fixed at 3)
-- NAT Gateway(s): `nat_gateway_count = 1` (cheap) or `3` (HA, one per AZ)
-- Public security group: SSH from `operator_ssh_cidrs`
-- Private security group: intra-VPC, SSH from public SG, NodePort 30080/30443 open
-
-## AWS Computing Module
-
-Resources per cluster:
-- N `aws_instance.node` (Ubuntu 24.04 LTS, IMDSv2-only, gp3 encrypted root)
-- Nodes placed in public subnets, distributed round-robin across AZs
-- Public IPs assigned — Route53 A records point to these for NodePort ingress
-- `instance_count` controls N; default 2
-
----
-
-## How to Add a New Provider
-
-1. Create the provider directory:
-   ```bash
-   mkdir -p terraform/<provider>/modules
-   ```
-
-2. Add root config files (`main.tf`, `variables.tf`, `outputs.tf`, `providers.tf`,
-   `versions.tf`, `.gitignore`) following the AWS layout.
-
-3. Add modules under `terraform/<provider>/modules/<module-name>/`.
-
-4. Add per-cluster tfvars and backend HCL files.
-
-Bare-metal providers (OVH, Latitude) follow the same pattern but use provider-specific
-Terraform providers instead of `hashicorp/aws`.
+- SSH always restricted to `operator_ssh_cidrs`; key-only auth.
+- AWS: IMDSv2 required, encrypted gp3; EKS: dedicated cluster/node IAM roles (required
+  managed policies only), OIDC/IRSA, control-plane logs, optional KMS secrets encryption.
+- GCP: dedicated minimal node service accounts (never default compute SA), GKE Workload
+  Identity, shielded + private nodes, NAT egress.
+- DigitalOcean: per-cluster VPC + droplet firewall (SSH from operators, intra-cluster,
+  NodePorts only); scoped API token.
+- Bare metal: provider API keys scoped to minimum routes; host/provider firewall expected.
+- Only NodePorts 30080/30443 (Kong) are public. K8s API 6443 is reached via SSH tunnel on
+  kubespray clusters; managed endpoints restricted via authorized-network tfvars.
 
 ---
 
 ## Key Constraints (locked — do not change without discussion)
 
 - **No MetalLB** — L2 breaks across AZs on AWS; BGP unsupported on EC2.
-- **No `Service type=LoadBalancer`** — no in-cluster LB controller. Public ingress is NodePort + Route53 multi-A.
+- **No `Service type=LoadBalancer`** on kubespray clusters — public ingress is
+  NodePort (30080/30443) + Route53 multi-A records.
 - **S3 backend with native locking** (`use_lockfile = true`) — no DynamoDB lock table.
-- **Calico VXLAN** CNI — works on AWS without src/dst-check hacks, portable to bare metal.
-- **Kubespray v2.30.0 + Kubernetes 1.34.3** — bump together when upgrading.
+- **Cilium CNI via ArgoCD** on kubespray clusters (`kube_network_plugin: cilium`,
+  cgroupv2 host-root workaround in `k8s-net-cilium.yml`); managed clusters keep their
+  provider CNI.
+- **Kubespray v2.31.0 + Kubernetes 1.34.x** — bump together when upgrading
+  (`KUBESPRAY_VERSION` env in scripts/kubespray.sh).
+- **Never add count/for_each to `module "network"` / `module "compute"` in terraform/aws**
+  — live state addresses depend on them.

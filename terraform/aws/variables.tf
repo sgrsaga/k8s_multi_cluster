@@ -15,6 +15,17 @@ variable "project" {
   default     = "k8s-multicluster"
 }
 
+variable "cluster_type" {
+  description = "Cluster flavour: 'kubespray' = EC2 VMs for a kubespray-built cluster, 'managed' = EKS cluster with a managed node group."
+  type        = string
+  default     = "kubespray"
+
+  validation {
+    condition     = contains(["kubespray", "managed"], var.cluster_type)
+    error_message = "cluster_type must be 'kubespray' or 'managed'."
+  }
+}
+
 variable "vpc_cidr" {
   description = "CIDR block for the VPC. Each cluster must use a unique, non-overlapping CIDR."
   type        = string
@@ -60,8 +71,9 @@ variable "operator_ssh_cidrs" {
 }
 
 variable "key_name" {
-  description = "Existing AWS EC2 key pair name in the target region."
+  description = "Existing AWS EC2 key pair name in the target region. Required for cluster_type = 'kubespray'; unused for 'managed'."
   type        = string
+  default     = null
 }
 
 variable "instance_type" {
@@ -91,4 +103,54 @@ variable "extra_tags" {
   description = "Additional tags merged into every resource."
   type        = map(string)
   default     = {}
+}
+
+# --- EKS (cluster_type = "managed") ---
+
+variable "kubernetes_version" {
+  description = "EKS Kubernetes version."
+  type        = string
+  default     = "1.31"
+}
+
+variable "eks_node_instance_types" {
+  description = "Instance types for the EKS managed node group."
+  type        = list(string)
+  default     = ["m5.large"]
+}
+
+variable "eks_node_desired" {
+  description = "Desired node count in the EKS managed node group."
+  type        = number
+  default     = 2
+}
+
+variable "eks_node_min" {
+  description = "Minimum node count in the EKS managed node group."
+  type        = number
+  default     = 2
+}
+
+variable "eks_node_max" {
+  description = "Maximum node count in the EKS managed node group."
+  type        = number
+  default     = 4
+}
+
+variable "eks_node_disk_gb" {
+  description = "Root volume size (GB) for EKS nodes."
+  type        = number
+  default     = 100
+}
+
+variable "eks_endpoint_public_access_cidrs" {
+  description = "CIDRs allowed to reach the public EKS API endpoint. Restrict to operator CIDRs in production."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
+variable "eks_enable_secrets_encryption" {
+  description = "Enable envelope encryption of Kubernetes secrets with a cluster-dedicated KMS key (rotation enabled)."
+  type        = bool
+  default     = true
 }
